@@ -1,4 +1,4 @@
-# MaxRegnerOS Client Makefile
+# ✅ CORRECT Makefile:
 
 CC ?= gcc
 CFLAGS ?= -std=c11 -O2 -g0 -Wall -Wextra -Wno-unused-parameter -Iinclude -D_GNU_SOURCE
@@ -7,11 +7,11 @@ ARCH ?= host
 BUILD_DIR ?= build/$(ARCH)
 TARGET ?= $(BUILD_DIR)/mrca-client
 
-# Detect if CC is targeting Android (e.g. aarch64-linux-android29-clang)
+# Check if compiling with an Android target compiler
 IS_ANDROID := $(if $(findstring android,$(CC)),1,0)
 
-# Android's Bionic C library incorporates pthread directly in libc.a.
-# Linking -lpthread on Android causes ld.lld to fail.
+# Bionic (Android libc) includes pthread functions directly in libc.a/libc.so.
+# Standard Linux glibc needs -lpthread.
 ifeq ($(IS_ANDROID),1)
     LDLIBS :=
 else
@@ -32,9 +32,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# ── LINE 29 FIX ──────────────────────────────────────────────────────────
-# OLD: $(CC) $(LDFLAGS) -static -o $@ $^ -lpthread
-# NEW: Replace -lpthread with $(LDLIBS)
+# LINE 29: Use $(LDLIBS) here instead of literal -lpthread
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -static -o $@ $^ $(LDLIBS)
 
