@@ -8,8 +8,9 @@ BUILD_DIR ?= build/$(ARCH)
 TARGET ?= $(BUILD_DIR)/mrca-client
 
 # -----------------------------------------------------------------------------
-# OS / Toolchain Detection
+# OS & Toolchain Detection
 # -----------------------------------------------------------------------------
+# Check if compiling with Android NDK toolchain or NDK_BUILD flag
 IS_ANDROID := 0
 
 ifneq ($(findstring android,$(CC)),)
@@ -20,13 +21,13 @@ endif
 
 # -----------------------------------------------------------------------------
 # Libraries (LDLIBS)
-# Android (Bionic C library) integrates pthread functions inside libc.a.
-# Explicitly linking -lpthread on Android causes ld.lld to fail.
+# Bionic (Android libc) includes pthread directly in libc.a / libc.so.
+# Linking -lpthread on Android causes ld.lld to fail with "unable to find library".
 # -----------------------------------------------------------------------------
 ifeq ($(IS_ANDROID),1)
-    LDLIBS :=
+    LDLIBS ?=
 else
-    LDLIBS := -lpthread
+    LDLIBS ?= -lpthread
 endif
 
 SRCS := log.c \
@@ -48,6 +49,9 @@ SRCS := log.c \
 
 OBJS := $(addprefix $(BUILD_DIR)/, $(SRCS:.c=.o))
 
+# -----------------------------------------------------------------------------
+# Build Rules
+# -----------------------------------------------------------------------------
 .PHONY: all clean test
 
 all: $(TARGET)
@@ -58,12 +62,12 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Line 29: Ensure $(LDLIBS) is used here rather than a hardcoded -lpthread!
+# Replaced explicit -lpthread with $(LDLIBS)
 $(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -static -o $@ $^ $(LDLIBS)
 
 test:
-	@echo "No unit tests defined."
+	@echo "No tests defined for client binary."
 
 clean:
 	rm -rf build
