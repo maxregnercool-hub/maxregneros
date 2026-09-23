@@ -43,6 +43,8 @@ jobs:
         env:
           ABI: ${{ matrix.abi }}
           API: ${{ matrix.api }}
+          NDK_BUILD: "1"
+          LDLIBS: ""  # Statically strips -lpthread for NDK
         run: sh build.sh --ndk
 
       - name: verify ELF class and machine
