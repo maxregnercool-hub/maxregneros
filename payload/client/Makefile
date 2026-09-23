@@ -1,43 +1,35 @@
-# Target executable
-TARGET ?= mrca-client
+# MaxRegnerOS Client Makefile
 
-# Compiler & Flags
 CC ?= gcc
 CFLAGS ?= -std=c11 -O2 -g0 -Wall -Wextra -Wno-unused-parameter -Iinclude -D_GNU_SOURCE
+BUILD_DIR ?= build/$(ARCH)
+TARGET ?= $(BUILD_DIR)/mrca-client
 
-# Detect NDK cross-compiler or NDK_BUILD flag
-ifneq ($(NDK_BUILD),1)
-    ifneq ($(findstring android,$(CC)),)
-        NDK_BUILD := 1
-    endif
-endif
+# Detect if we are building with Android NDK
+IS_ANDROID := $(if $(findstring android,$(CC)),1,0)
 
-# Assign libraries: -lpthread is excluded on Android NDK builds
-ifeq ($(NDK_BUILD),1)
-    LDLIBS ?=
+# Bionic (Android libc) includes pthread functions directly in libc.
+# Standard Linux GLIBC requires explicit -lpthread.
+ifeq ($(IS_ANDROID),1)
+    LDLIBS :=
 else
-    LDLIBS ?= -lpthread
+    LDLIBS := -lpthread
 endif
 
-# Source files
-SRCS := log.c util.c ring.c net.c ws.c proto.c input.c display.c drm.c codec.c audio.c metrics.c watchdog.c config.c mrca_status.c main.c
+SRCS := log.c util.c ring.c net.c ws.c proto.c input.c display.c drm.c \
+        codec.c audio.c metrics.c watchdog.c config.c mrca_status.c main.c
 OBJS := $(addprefix $(BUILD_DIR)/, $(SRCS:.c=.o))
 
-BUILD_DIR ?= build
+.PHONY: all clean
 
-.PHONY: all clean test
-
-all: $(BUILD_DIR)/$(TARGET)
+all: $(TARGET)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/$(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-
-test:
-	@echo "Running tests..."
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -static -o $@ $^ $(LDLIBS)
 
 clean:
-	rm -rf build/
+	rm -rf build
