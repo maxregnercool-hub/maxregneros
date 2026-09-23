@@ -1,0 +1,36 @@
+#!/system/bin/sh
+# MaxRegnerOS — pick the right native binary for this device, if one exists.
+# Prints the path to a usable mrca-client, or nothing when only the shell
+# runtime is available. Never fails the caller.
+
+MRCA_DIR="${MRCA_DIR:-${0%/*}}"
+[ -d "$MRCA_DIR" ] || MRCA_DIR=/data/adb/maxregner/bin
+
+pick() {
+  abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+  abi2=$(getprop ro.product.cpu.abi2 2>/dev/null)
+  for a in "$abi" "$abi2" arm64-v8a armeabi-v7a x86_64 arm64 arm; do
+    [ -n "$a" ] || continue
+    case "$a" in
+      arm64*|aarch64*) d=arm64-v8a ;;
+      armeabi*|armv7*|arm) d=armeabi-v7a ;;
+      x86_64*) d=x86_64 ;;
+      *) continue ;;
+    esac
+    if [ -x "$MRCA_DIR/$d/mrca-client" ]; then
+      echo "$MRCA_DIR/$d/mrca-client"
+      return 0
+    fi
+  done
+  # flat fallback
+  [ -x "$MRCA_DIR/mrca-client" ] && echo "$MRCA_DIR/mrca-client"
+  return 0
+}
+
+case "${1:-path}" in
+  path) pick ;;
+  have) p=$(pick); [ -n "$p" ] && echo yes || echo no ;;
+  abi)  getprop ro.product.cpu.abi ;;
+  *)    pick ;;
+esac
+exit 0

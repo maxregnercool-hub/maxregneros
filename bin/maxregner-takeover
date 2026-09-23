@@ -1,0 +1,150 @@
+#!/system/bin/sh
+# MaxRegnerOS system takeover engine.
+MR=/data/adb/maxregner
+MODDIR=/data/adb/modules/maxregner
+BIN="$MODDIR/bin"
+LOG="$MR/log/takeover.log"
+STATE="$MR/state"
+SC="$MR/screens"
+HB="$STATE/heartbeat"
+WATCHDOG_TIMEOUT=25
+
+log(){ echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
+
+fbdev(){
+  for c in /dev/graphics/fb0 /dev/graphics/fb1; do [ -e "$c" ] && { echo "$c"; return; }; done
+  return 1
+}
+drmdev(){
+  for c in /dev/dri/card0 /dev/dri/card1; do [ -e "$c" ] && { echo "$c"; return; }; done
+  return 1
+}
+
+detect_geom(){
+  # 1) wm size  2) fb var  3) DRM  4) fallback
+  G=$(wm size 2>/dev/null | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | head -1)
+  [ -n "$G" ] && { echo "$G"; return; }
+  FB=$(fbdev)
+  if [ -n "$FB" ]; then
+    G=$(dd if="$FB" bs=1 count=160 2>/dev/null | od -An -tu4 -j 0 -N 8 | \
+        awk '{print $1" "$2}')
+    case "$G" in *[!0-9\ ]*) G="";; esac
+    [ -n "$G" ] && { echo "$G"; return; }
+  fi
+  echo "1080 2400"
+}
+
+stop_ui(){
+  # stop the stock surfaces so we can own the display
+  log "stopping stock UI"
+  for p in com.android.systemui com.google.android.apps.nexuslauncher \
+           com.android.launcher3 com.sec.android.app.launcher com.miui.home; do
+    am force-stop "$p" 2>/dev/null
+  done
+  settings put global policy_control immersive.full=* 2>/dev/null
+}
+
+set_home(){
+  # make MaxRegnerOS the HOME intent target
+  log "setting HOME"
+  for c in com.maxregner.shell/.HomeActivity com.maxregner.shell/.Main; do
+    cmd package set-home-activity "$c" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+render_if_needed(){
+  W=$1; H=$2
+  mkdir -p "$SC"
+  if [ ! -f "$SC/$W""x""$H/index" ]; then
+    log "rendering screens at ${W}x${H}"
+    sh "$BIN/maxregner-screen" build "$W" "$H" >> "$LOG" 2>&1
+  fi
+}
+
+arm(){
+  . "$BIN/maxregner-safemode" 2>/dev/null
+
+  if [ -f "$STATE/safemode" ]; then log "safe mode - not arming"; return 0; fi
+  if [ -f "$STATE/takeover_on" ]; then log "already armed"; return 0; fi
+
+  GEOM=$(detect_geom)
+  W=$(echo "$GEOM" | cut -d' ' -f1)
+  H=$(echo "$GEOM" | cut -d' ' -f2)
+  log "geometry ${W}x${H}"
+  echo "$W $H" > "$STATE/geom"
+
+  render_if_needed "$W" "$H"
+
+  # start the watchdog FIRST so a failure can never strand the device
+  ( sh "$BIN/maxregner-takeover" watchdog "$W" "$H" & echo $! > "$STATE/watchdog.pid" ) &
+  sleep 1
+
+  take "$W" "$H"
+}
+
+take(){
+  W=$1; H=$2
+  touch "$HB"
+  log "== TAKEOVER START ${W}x${H} =="
+
+  stop_ui
+
+  # paint our shell onto the panel
+  if sh "$BIN/maxregner-screen" present home 0 0 "$W" "$H" >> "$LOG" 2>&1; then
+    log "home painted"
+    touch "$HB"
+  else
+    log "paint FAILED - aborting takeover"
+    restore
+    return 1
+  fi
+
+  # input loop
+  ( sh "$BIN/maxregner-input" loop "$W" "$H" >> "$LOG" 2>&1 & \
+    echo $! > "$STATE/input.pid" ) &
+
+  touch "$STATE/takeover_on"
+  touch "$HB"
+  log "takeover live"
+}
+
+watchdog(){
+  W=$1; H=$2
+  log "watchdog armed (${W}x${H}, ${WATCHDOG_TIMEOUT}s)"
+  n=0
+  while [ "$n" -lt "$WATCHDOG_TIMEOUT" ]; do
+    [ -f "$HB" ] && { log "heartbeat ok"; return 0; }
+    n=$((n + 1)); sleep 1
+  done
+  log "!! NO HEARTBEAT - auto-restoring stock Android"
+  touch "$STATE/safemode"
+  restore
+}
+
+restore(){
+  log "== RESTORE =="
+  for f in input.pid watchdog.pid client.pid; do
+    p=$(cat "$STATE/$f" 2>/dev/null)
+    case "$p" in ''|*[!0-9]*) ;; *) kill "$p" 2>/dev/null;; esac
+    rm -f "$STATE/$f"
+  done
+  rm -f "$STATE/takeover_on"
+  for p in com.android.systemui; do am start-service -n "$p/.SystemUIService" 2>/dev/null; done
+  am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null
+  settings put global policy_control null 2>/dev/null
+  log "stock Android restored"
+}
+
+case "$1" in
+  arm)      arm ;;
+  take)     take "$(cat "$STATE/geom" 2>/dev/null | cut -d' ' -f1)" "$(cat "$STATE/geom" 2>/dev/null | cut -d' ' -f2)" ;;
+  watchdog) watchdog "$2" "$3" ;;
+  restore|release) restore ;;
+  status)
+    if [ -f "$STATE/takeover_on" ]; then echo "takeover: ON"; else echo "takeover: off"; fi
+    [ -f "$STATE/safemode" ] && echo "safe mode: ON"
+    echo "geometry: $(cat "$STATE/geom" 2>/dev/null || echo unknown)"
+    ;;
+  *) echo "usage: maxregner-takeover {arm|take|restore|status}"; exit 1 ;;
+esac

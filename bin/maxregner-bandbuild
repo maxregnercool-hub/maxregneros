@@ -1,0 +1,107 @@
+#!/system/bin/sh
+# MaxRegnerOS — composite ONE app row into a cached full-width strip.
+#
+# Why full-width: a strip exactly STRIDE bytes wide per row is pushed to the
+# panel with ONE dd.  Anything narrower costs one dd per row.  So the
+# expensive horizontal compositing happens here — once, at sync — and the
+# draw path stays at N dd calls for N visible rows.
+#
+# usage: maxregner-bandbuild <geom> <out> <hue> <letter> <title> <subtitle>
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+
+GID="$1"; OUT="$2"; HUE="$3"; LETTER="$4"; TITLE="$5"; SUB="$6"
+[ -z "$GID" ] && { echo "bandbuild: geometry required" >&2; exit 2; }
+geom_load "$GID" || { echo "bandbuild: unknown geometry $GID" >&2; exit 2; }
+
+FONTDIR="$MASSETS/fonts"
+AVDIR="$MASSETS/avatars"
+
+blit_rect() {
+  local f="$1" sw="$2" sh="$3" dx="$4" dy="$5" r=0 rowb=$((sw * 2))
+  [ -f "$f" ] || return 1
+  if [ "$sw" -eq "$GSTRIDE" ]; then
+    dd if="$f" of="$OUT" bs="$GSTRIDE" seek="$dy" count="$sh" conv=notrunc 2>/dev/null
+    return $?
+  fi
+  while [ "$r" -lt "$sh" ]; do
+    dd if="$f" of="$OUT" bs=1 \
+       skip=$((r * rowb)) \
+       seek=$(((dy + r) * GSTRIDE + dx * 2)) \
+       count=$rowb conv=notrunc 2>/dev/null
+    r=$((r + 1))
+  done
+  return 0
+}
+
+load_metrics() {
+  local mt="$FONTDIR/${GID}_${1}_metrics.tsv"
+  [ -f "$mt" ] || return 1
+  local code w h x0 y0 adv
+  while IFS='	' read -r code w h x0 y0 adv; do
+    case "$code" in ''|\#*) continue ;; esac
+    eval "MW_$code=$w; MH_$code=$h; MX_$code=$x0; MY_$code=$y0; MA_$code=$adv"
+  done < "$mt"
+}
+
+draw_text() {
+  local s="$1" size="$2" tx="$3" ty="$4" col="$5" maxw="$6"
+  local i=0 n=${#s} pen=0 code gw gh gx gy gadv ch gf
+  local dotw=$(( (GLG * 3) / 2 ))
+  local avail=$((maxw - dotw))
+  local trunc=0
+
+  while [ "$i" -lt "$n" ]; do
+    ch=$(printf '%s' "$s" | cut -c$((i + 1)))
+    code=$(printf '%d' "'$ch" 2>/dev/null)
+    case "$code" in ''|*[!0-9]*) i=$((i + 1)); continue ;; esac
+    if [ "$code" -lt 32 ] || [ "$code" -gt 126 ]; then code=63; fi
+    eval "gw=\$MW_$code; gh=\$MH_$code; gx=\$MX_$code; gy=\$MY_$code; gadv=\$MA_$code"
+    [ -z "$gadv" ] && gadv=$((GLG / 2))
+    if [ "$pen" -gt 0 ] && [ $((pen + gadv)) -gt "$avail" ]; then trunc=1; break; fi
+    if [ "${gw:-0}" -gt 0 ]; then
+      gf="$FONTDIR/${GID}_${size}_${col}_$(printf '%03d' "$code").raw"
+      blit_rect "$gf" "$gw" "$gh" $((tx + pen + gx)) $((ty + gy))
+    fi
+    pen=$((pen + gadv))
+    i=$((i + 1))
+  done
+
+  if [ "$trunc" = "1" ]; then
+    local d=0 dcode=46
+    eval "gw=\$MW_$dcode; gh=\$MH_$dcode; gx=\$MX_$dcode; gy=\$MY_$dcode; gadv=\$MA_$dcode"
+    gf="$FONTDIR/${GID}_${size}_${col}_046.raw"
+    while [ "$d" -lt 3 ]; do
+      blit_rect "$gf" "$gw" "$gh" $((tx + pen + gx)) $((ty + gy))
+      pen=$((pen + gadv))
+      d=$((d + 1))
+    done
+  fi
+}
+
+# 1. clean strip (zero = black in rgb565, so /dev/zero is the background)
+dd if=/dev/zero of="$OUT" bs="$GSTRIDE" count="$GBAND" 2>/dev/null
+
+# 2. hairline rule at the foot of the row
+SEPF="$MASSETS/ui/${GID}_sep.raw"
+[ -f "$SEPF" ] && dd if="$SEPF" of="$OUT" bs="$GSTRIDE" \
+    seek=$((GBAND - 2)) count=1 conv=notrunc 2>/dev/null
+
+# 3. letter tile
+lcode=$(printf '%d' "'$LETTER" 2>/dev/null)
+case "$lcode" in ''|*[!0-9]*) lcode=35 ;; esac
+blit_rect "$AVDIR/${GID}_h${HUE}_$(printf '%03d' "$lcode").raw" "$GAV" "$GAV" "$GAX" "$GAVY"
+
+# 4. text
+TEXTMAX=$((GW - GTX - GCHW - (GW / 12)))
+load_metrics large
+draw_text "$TITLE" large "$GTX" "$GTY1" w "$TEXTMAX"
+load_metrics small
+draw_text "$SUB"   small "$GTX" "$GTY2" m "$TEXTMAX"
+
+# 5. chevron
+CHF="$MASSETS/ui/${GID}_chev.raw"
+[ -f "$CHF" ] && [ "${GCHW:-0}" -gt 0 ] && \
+  blit_rect "$CHF" "$GCHW" "$GCHH" $((GW - GCHW - GW / 24)) $(((GBAND - GCHH) / 2))
+
+exit 0

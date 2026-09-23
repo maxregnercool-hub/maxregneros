@@ -1,0 +1,62 @@
+#!/system/bin/sh
+# MaxRegnerOS — adaptive UI composer.  Draws a whole screen into one buffer,
+# then presents it with a SINGLE dd.  Builds on mrca-raster.sh.
+#
+# usage: mrca-uikit <draw_fn> <out.raw>
+#   draw_fn receives no args; it uses the AG_*/RAST_* globals.
+
+UI_LIB=1
+
+ui_boot() {
+  . /data/adb/maxregner/bin/maxregner-geom.sh
+  . /data/adb/maxregner/bin/mrca-raster.sh
+  ag_probe || { echo "uikit: no panel" >&2; return 1; }
+  ag_derive
+  RAST_TBL="${RAST_TBL:-/data/adb/maxregner/assets/raster/font16.tbl}"
+  RAST_TMP="${RAST_TMP:-/data/adb/maxregner/run/rast}"
+  export RAST_TBL RAST_TMP
+  raster_init "$AG_W" "$AG_H" "$AG_STRIDE" "$AG_PB"
+}
+
+ui_begin()  { raster_new "$1"; raster_rect "$1" 0 0 "$AG_W" "$AG_H" bg; }
+ui_present(){ # ONE write for the whole screen
+  local fb="$1" buf="$2"
+  [ -w "$fb" ] || return 1
+  dd if="$buf" of="$fb" bs="$AG_STRIDE" count="$AG_H" conv=notrunc 2>/dev/null
+}
+
+ui_header() { # buf title subtitle
+  raster_rect "$1" 0 0 "$AG_W" "$AG_HH" surface
+  raster_text "$1" "$AG_PAD" $((AG_HH / 2 - AG_TSZ * 3 / 4)) "$2" "$AG_TSZ" text "$((AG_W - AG_PAD * 2))"
+  [ -n "$3" ] && raster_text "$1" "$AG_PAD" $((AG_HH - AG_HH / 4)) "$3" "$AG_SSZ" dim "$((AG_W - AG_PAD * 2))"
+  raster_hline "$1" 0 "$AG_HH" "$AG_W" border
+}
+
+ui_footer() { # buf label
+  local y=$((AG_H - AG_FH))
+  raster_rect "$1" 0 "$y" "$AG_W" "$AG_FH" surface
+  raster_hline "$1" 0 "$y" "$AG_W" border
+  raster_text "$1" "$AG_PAD" $((y + AG_FH / 2 - AG_SSZ * 3 / 4)) "$2" "$AG_SSZ" dim "$((AG_W - AG_PAD * 2))"
+}
+
+# One app row.  Bands are full-width by construction, so each is one dd.
+ui_band() { # buf y letter title sub hue
+  local b="$1" y="$2" L="$3" T="$4" S="$5" H="$6"
+  local col accent; [ "$H" = "1" ] && col=accent2
+  [ "$H" = "0" ] && col=accent
+  [ -z "$col" ] && col=accent2
+  raster_rect "$b" 0 "$y" "$AG_W" "$AG_BAND" bg
+  raster_rrect "$b" "$AG_PAD" $((y + (AG_BAND - (AG_BAND - AG_AV)) / 4)) $((AG_W - AG_PAD * 2)) $((AG_BAND - AG_BAND / 4)) "$AG_RAD" card
+  raster_rect "$b" $((AG_AVX)) $((y + AG_AVY / 2)) "$AG_AV" "$AG_AV" "$col"
+  raster_text "$b" $((AG_AVX + AG_AV / 2 - AG_TSZ * 2 / 5)) $((y + AG_AVY / 2 + AG_AV / 2 - AG_TSZ * 3 / 4)) "$L" "$AG_TSZ" black 0
+  raster_text "$b" "$AG_TX" $((y + AG_AVY / 2 + AG_AV / 8)) "$T" "$AG_TSZ" text "$AG_AVAIL"
+  raster_text "$b" "$AG_TX" $((y + AG_AVY / 2 + AG_AV / 8 + AG_TSZ + 4)) "$S" "$AG_SSZ" dim "$AG_AVAIL"
+  # disclosure chevron
+  local cx=$((AG_W - AG_PAD - AG_BAND / 6)) cy=$((y + AG_BAND / 2)) i
+  i=0
+  while [ "$i" -lt 10 ]; do
+    raster_rect "$b" $((cx + i / 2)) $((cy - 5 + i)) 2 1 dim
+    raster_rect "$b" $((cx + i / 2)) $((cy + 4 - i)) 2 1 dim
+    i=$((i + 1))
+  done
+}

@@ -1,0 +1,62 @@
+#!/system/bin/sh
+# MaxRegnerOS — start an installed app from the registry.
+#
+#   maxregner-launch <package> [component]
+#   maxregner-launch --index <n>      launch the nth registry entry
+#   maxregner-launch --label <text>   launch the first entry matching a label
+#
+# Launch is attempted three ways, most specific first, because OEM builds
+# differ in which one works: explicit component -> launcher monkey intent ->
+# plain am start with the launcher category.
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+
+PKG=""; COMP=""
+
+case "$1" in
+  --index)
+    N="$2"
+    [ -s "$REGTSV" ] || { echo "launch: no registry"; exit 4; }
+    LINE=$(awk -v n="$N" 'NR==n+1{print; exit}' "$REGTSV")
+    [ -z "$LINE" ] && { echo "launch: no entry #$N"; exit 4; }
+    PKG=$(printf '%s' "$LINE" | cut -f1)
+    COMP=$(printf '%s' "$LINE" | cut -f3)
+    ;;
+  --label)
+    [ -s "$REGTSV" ] || { echo "launch: no registry"; exit 4; }
+    LINE=$(awk -F'\t' -v q="$2" 'tolower($2) ~ tolower(q) {print; exit}' "$REGTSV")
+    [ -z "$LINE" ] && { echo "launch: no app matches '$2'"; exit 4; }
+    PKG=$(printf '%s' "$LINE" | cut -f1)
+    COMP=$(printf '%s' "$LINE" | cut -f3)
+    ;;
+  *)
+    PKG="$1"; COMP="$2"
+    ;;
+esac
+
+[ -z "$PKG" ] && { echo "usage: maxregner-launch <pkg> [component] | --index n | --label text"; exit 2; }
+
+LBL=$(awk -F'\t' -v p="$PKG" '$1==p{print $2; exit}' "$REGTSV")
+[ -z "$LBL" ] && LBL="$PKG"
+applog "launch: $LBL ($PKG) comp=$COMP"
+
+if [ -n "$COMP" ]; then
+  if am start -n "$COMP" >/dev/null 2>&1; then
+    echo "launched: $LBL  ($COMP)"
+    exit 0
+  fi
+fi
+
+if monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; then
+  echo "launched: $LBL  (monkey)"
+  exit 0
+fi
+
+if am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$PKG" >/dev/null 2>&1; then
+  echo "launched: $LBL  (category intent)"
+  exit 0
+fi
+
+echo "launch failed: $LBL ($PKG)"
+applog "launch FAILED: $PKG"
+exit 5

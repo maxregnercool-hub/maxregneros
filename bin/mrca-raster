@@ -1,0 +1,245 @@
+#!/system/bin/sh
+# MaxRegnerOS — adaptive software rasterizer.  Pure shell + dd, no compiler,
+# no browser, no per-resolution assets.
+#
+# WHY THIS EXISTS
+#   v1.5 needed a pre-baked glyph cache per panel profile, so it only worked on
+#   the four resolutions we happened to ship.  This rasterizer derives its
+#   output size at runtime from an 8x16 RLE glyph table, so ANY panel works.
+#
+# HOW A PIXEL IS WRITTEN
+#   Fills go in as contiguous byte blocks via dd.  A full-width rect is ONE dd
+#   (exactly the band trick); a narrower rect costs one dd per row.  Row
+#   patterns are cached by (colour,width) so repeated chrome is built once.
+#
+# TARGET MODEL
+#   All drawing writes into a flat raw buffer (the band), NOT the framebuffer.
+#   raster_present() then pushes the whole band with ONE dd to the panel.
+
+RAST_LIB=1
+RAST_TBL="${RAST_TBL:-/data/adb/maxregner/assets/raster/font16.tbl}"
+RAST_TMP="${RAST_TMP:-/data/adb/maxregner/run/rast}"
+RAST_W=0; RAST_H=0; RAST_STRIDE=0; RAST_BPP=2; RAST_PB=2
+
+# ---------------------------------------------------------------- colour ---
+# name -> "r g b"
+raster_palette() {
+  case "$1" in
+    bg)      echo "14 17 22"    ;;
+    surface) echo "22 27 34"    ;;
+    card)    echo "30 36 45"    ;;
+    border)  echo "48 54 61"    ;;
+    accent)  echo "63 185 80"   ;;
+    accent2) echo "88 166 255"  ;;
+    text)    echo "230 237 243" ;;
+    dim)     echo "139 148 158";;
+    black)   echo "0 0 0"       ;;
+    white)   echo "255 255 255" ;;
+    warn)    echo "210 153 34"  ;;
+    *)       echo "230 237 243" ;;
+  esac
+}
+
+# name -> 2 or 4 raw bytes honouring the active bpp
+raster_pat() {
+  local nm="$1" rgb r g b v lo hi
+  rgb=$(raster_palette "$nm"); set -- $rgb; r=$1; g=$2; b=$3
+  if [ "$RAST_BPP" -eq 2 ]; then
+    v=$(( ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) ))
+    lo=$((v & 255)); hi=$(((v >> 8) & 255))
+    printf "\\$(printf '%03o' "$lo")"
+    printf "\\$(printf '%03o' "$hi")"
+  else
+    printf "\\$(printf '%03o' "$b")"
+    printf "\\$(printf '%03o' "$g")"
+    printf "\\$(printf '%03o' "$r")"
+    printf '\\377'
+  fi
+}
+
+# ------------------------------------------------------------ primitives ---
+raster_init() { # W H STRIDE BPP BYTES_PER_PX
+  RAST_W="$1"; RAST_H="$2"; RAST_STRIDE="$3"; RAST_BPP="${4:-2}"; RAST_PB="${5:-2}"
+  # cache identity = font table size+mtime; a new font invalidates every glyph
+  RAST_FONTKEY=$( [ -f "$RAST_TBL" ] && { wc -c < "$RAST_TBL" | tr -d ' '; ls -l "$RAST_TBL" 2>/dev/null | awk '{print $6$7$8}'; } || echo none | tr '\n' '_' )
+  mkdir -p "$RAST_TMP" 2>/dev/null
+  mkdir -p "$RAST_TMP/rows" "$RAST_TMP/glyphs" 2>/dev/null
+  if [ "$RAST_BPP" -eq 2 ]; then RAST_PB=2; else RAST_PB=4; fi
+  RAST_ROWBYTES=$((RAST_W * RAST_PB))
+}
+
+# Cache the repeated pixel pattern for a given width, built by DOUBLING
+# (log2 steps) rather than a per-pixel loop.
+raster_rowpat() { # colname width -> path to a row of that many pixels
+  local nm="$1" w="$2" key f n=1
+  mkdir -p "$RAST_TMP/rows" 2>/dev/null
+  key="$RAST_TMP/rows/${RAST_BPP}_${nm}_${w}.raw"
+  [ -f "$key" ] && { echo "$key"; return 0; }
+  raster_pat "$nm" > "$RAST_TMP/rows/.p.raw"
+  cp "$RAST_TMP/rows/.p.raw" "$RAST_TMP/rows/.r.raw"
+  while [ "$n" -lt "$w" ]; do
+    cat "$RAST_TMP/rows/.r.raw" "$RAST_TMP/rows/.r.raw" > "$RAST_TMP/rows/.d.raw" 2>/dev/null
+    mv "$RAST_TMP/rows/.d.raw" "$RAST_TMP/rows/.r.raw"
+    n=$((n * 2))
+  done
+  dd if="$RAST_TMP/rows/.r.raw" of="$key" bs="$RAST_PB" count="$w" 2>/dev/null
+  echo "$key"
+}
+
+# raster_rect TARGET X Y W H COLNAME
+raster_rect() {
+  local tgt="$1" x="$2" y="$3" w="$4" h="$5" col="$6"
+  [ "$w" -le 0 ] || [ "$h" -le 0 ] && return 0
+  [ "$w" -le 0 ] && return 0
+  local row f i=0
+  row=$(raster_rowpat "$col" "$w")
+  [ -f "$row" ] || return 1
+  # FULL-WIDTH FAST PATH -------------------------------------------------
+  # A rect spanning the whole width is a CONTIGUOUS byte block: h rows of
+  # RAST_STRIDE.  One dd instead of h of them.  This is the chrome hot path
+  # (status bar, header, nav) and it is where most of the render time went.
+  if [ "$x" -eq 0 ] && [ "$w" -eq "$RAST_W" ]; then
+    dd if="$row" of="$tgt" bs="$RAST_STRIDE" seek="$y" count="$h" conv=notrunc 2>/dev/null
+    return 0
+  fi
+  while [ "$i" -lt "$h" ]; do
+    dd if="$row" of="$tgt" bs=1 \
+       seek=$(( (y + i) * RAST_STRIDE + x * RAST_PB )) \
+       count=$((w * RAST_PB)) conv=notrunc 2>/dev/null
+    i=$((i + 1))
+  done
+}
+
+# Approximate a rounded rect: inset the first and last few rows.
+# raster_rrect TARGET X Y W H R COLNAME
+raster_rrect() {
+  local tgt="$1" x="$2" y="$3" w="$4" h="$5" r="$6" col="$7" i
+  [ "$r" -le 0 ] && { raster_rect "$tgt" "$x" "$y" "$w" "$h" "$col"; return 0; }
+  [ "$r" -gt $((h / 2)) ] && r=$((h / 2))
+  for i in $(seq 0 $((r - 1))); do
+    # circle-ish inset per row
+    local ins=$(( r - (r * r - (r - i) * (r - i)) / (2 * r + 1) ))
+    [ "$ins" -lt 0 ] && ins=0
+    [ "$ins" -gt "$r" ] && ins="$r"
+    raster_rect "$tgt" $((x + ins)) $((y + i)) $((w - 2 * ins)) 1 "$col"
+    raster_rect "$tgt" $((x + ins)) $((y + h - 1 - i)) $((w - 2 * ins)) 1 "$col"
+  done
+  raster_rect "$tgt" "$x" $((y + r)) "$w" $((h - 2 * r)) "$col"
+}
+
+# raster_hline TARGET X Y W COLNAME   /  raster_vline ...
+raster_hline() { raster_rect "$1" "$2" "$3" "$4" 1 "$5"; }
+raster_vline() { raster_rect "$1" "$2" "$3" 1 "$4" "$5"; }
+
+# ---------------------------------------------------------------- glyphs ---
+# One glyph bitmap, expanded from the RLE table into a raw strip.
+# Cached by (size,colour,code) so RLE parsing happens once per glyph.
+raster_glyph() { # size colname code -> path
+  local sz="$1" col="$2" code="$3" gdir key line rows i rl run a b gx gy k
+  gdir="$RAST_TMP/glyphs"
+  # subshell-safe: raster_glyph runs in $( ), so a shell VARIABLE cannot carry
+  # the "already initialised" flag.  A marker FILE does.
+  if [ "$(cat "$RAST_TMP/.fontkey" 2>/dev/null)" != "$RAST_FONTKEY" ]; then
+    rm -rf "$gdir" "$RAST_TMP/rows"
+    mkdir -p "$gdir" "$RAST_TMP/rows"
+    printf '%s' "$RAST_FONTKEY" > "$RAST_TMP/.fontkey"
+  fi
+  key="$gdir/${RAST_FONTKEY}_${sz}_${col}_${code}.raw"
+  [ -f "$key" ] && { echo "$key"; return 0; }
+  [ -f "$RAST_TBL" ] || return 1
+  line=$(awk -F'|' -v c="$code" '$1==c{print $2; exit}' "$RAST_TBL")
+  [ -z "$line" ] && return 1
+
+  local scale=$(( sz / 16 )); [ "$scale" -lt 1 ] && scale=1
+  local gw=$(( 8 * scale )) gh=$(( 16 * scale ))
+  local pbfile="$RAST_TMP/glyphs/.p_${col}.raw"
+  raster_pat "$col" > "$pbfile"
+  : > "$key"
+  # blank strip first
+  dd if=/dev/zero of="$key" bs=1 count=$((gw * gh * RAST_PB)) 2>/dev/null
+
+  i=0
+  local oldifs="$IFS"; IFS=';'
+  for rl in $line; do
+    IFS="$oldifs"
+    [ "$rl" = "-" ] && { i=$((i + 1)); continue; }
+    IFS=','
+    for run in $rl; do
+      IFS="$oldifs"
+      a=${run%%:*}; b=${run##*:}
+      local rx=$(( a * scale )) rw=$(( b * scale )) rp
+      rp=$(raster_rowpat "$col" "$rw")
+      [ -f "$rp" ] || continue
+      k=0
+      while [ "$k" -lt "$scale" ]; do
+        dd if="$rp" of="$key" bs=1 \
+           seek=$(( ((i * scale + k) * gw + rx) * RAST_PB )) \
+           count=$((rw * RAST_PB)) conv=notrunc 2>/dev/null
+        k=$((k + 1))
+      done
+    done
+    i=$((i + 1))
+  done
+  IFS="$oldifs"
+  echo "$key"
+}
+
+# raster_text TARGET X Y STR SIZE COLNAME [MAXW]
+raster_text() {
+  local tgt="$1" x="$2" y="$3" s="$4" sz="$5" col="$6" maxw="$7"
+  local scale=$(( sz / 16 )); [ "$scale" -lt 1 ] && scale=1
+  local adv=$(( 9 * scale ))          # 8px cell + 1px tracking
+  local dotw=$(( adv * 3 ))
+  local avail=0; [ -n "$maxw" ] && avail=$((maxw - dotw))
+  local pen=0 i=0 n=${#s} ch code gf gw gh k
+  gw=$(( 8 * scale )); gh=$(( 16 * scale ))
+  while [ "$i" -lt "$n" ]; do
+    ch=$(printf '%s' "$s" | cut -c$((i + 1)))
+    code=$(printf '%d' "'$ch" 2>/dev/null)
+    case "$code" in ''|*[!0-9]*) i=$((i + 1)); continue ;; esac
+    [ "$code" -lt 32 ] || [ "$code" -gt 126 ] && code=63
+    if [ -n "$maxw" ] && [ "$avail" -gt 0 ] && [ $((pen + adv)) -gt "$avail" ]; then
+      # ellipsis and stop
+      gf=$(raster_glyph "$sz" "$col" 46)
+      local dx=$((x + pen))
+      k=0
+      while [ "$k" -lt "$gh" ]; do
+        dd if="$gf" of="$tgt" bs=1 skip=$((k * gw * RAST_PB)) \
+           seek=$(( ((y + k) * RAST_STRIDE) + dx * RAST_PB )) \
+           count=$((gw * RAST_PB)) conv=notrunc 2>/dev/null
+        k=$((k + 1))
+      done
+      return 0
+    fi
+    gf=$(raster_glyph "$sz" "$col" "$code")
+    if [ -n "$gf" ] && [ -f "$gf" ]; then
+      k=0
+      while [ "$k" -lt "$gh" ]; do
+        dd if="$gf" of="$tgt" bs=1 skip=$((k * gw * RAST_PB)) \
+           seek=$(( ((y + k) * RAST_STRIDE) + (x + pen) * RAST_PB )) \
+           count=$((gw * RAST_PB)) conv=notrunc 2>/dev/null
+        k=$((k + 1))
+      done
+    fi
+    pen=$((pen + adv))
+    i=$((i + 1))
+  done
+  RAST_PEN=$((pen))
+}
+raster_text_width() { # STR SIZE
+  local n=${#1} sz="$2" scale=$(( sz / 16 ))
+  [ "$scale" -lt 1 ] && scale=1
+  echo $(( n * 9 * scale ))
+}
+
+# ------------------------------------------------------------- composite ---
+raster_clear() {
+  # Sparse extend instead of writing W*H*PB bytes at bs=1: that was millions of
+  # syscalls (5 MB at 1080x2400) and dominated the whole render.  Truncate to
+  # zero, then write ONE byte at the last offset -- the kernel fills the gap
+  # with zero pages, so the file is the right length and reads back as black.
+  local n=$(( RAST_W * RAST_H * RAST_PB ))
+  : > "$1"
+  [ "$n" -gt 1 ] && dd if=/dev/zero of="$1" bs=1 count=1 seek=$(( n - 1 )) conv=notrunc 2>/dev/null
+}
+raster_new() { : > "$1"; raster_clear "$1"; }

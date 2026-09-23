@@ -1,0 +1,58 @@
+#!/system/bin/sh
+# evdev touch reader -> hit test -> band repaint.
+MR=/data/adb/maxregner
+BIN=/data/adb/modules/maxregner/bin
+LOG="$MR/log/input.log"
+HB="$MR/state/heartbeat"
+log(){ echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
+
+find_touch(){
+  for e in /dev/input/event*; do
+    [ -e "$e" ] || continue
+    getevent -pl "$e" 2>/dev/null | grep -q "ABS_MT_POSITION_X" && { echo "$e"; return 0; }
+  done
+  return 1
+}
+
+axis_max(){
+  # axis_max <device> <AXISNAME> <fallback>
+  v=$(getevent -pl "$1" 2>/dev/null | sed -n "s/.*$2.*max \([0-9]*\).*/\1/p" | head -1)
+  case "$v" in ''|*[!0-9]*) echo "$3" ;; *) echo "$v" ;; esac
+}
+
+loop(){
+  W=$1; H=$2
+  EV=$(find_touch)
+  if [ -z "$EV" ]; then log "no touchscreen"; sleep 5; return 1; fi
+  MAXX=$(axis_max "$EV" ABS_MT_POSITION_X "$W")
+  MAXY=$(axis_max "$EV" ABS_MT_POSITION_Y "$H")
+  [ "$MAXX" -le 0 ] && MAXX=$W
+  [ "$MAXY" -le 0 ] && MAXY=$H
+  log "touch=$EV range=${MAXX}x${MAXY} canvas=${W}x${H}"
+
+  X=-1; Y=-1; DOWN=0; LX=-1; LY=-1
+  getevent -lt "$EV" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *ABS_MT_POSITION_X*)  X=$(echo "$line" | awk '{print $NF}') ;;
+      *ABS_MT_POSITION_Y*)  Y=$(echo "$line" | awk '{print $NF}') ;;
+      *BTN_TOUCH*DOWN*)     DOWN=1 ;;
+      *BTN_TOUCH*UP*)       DOWN=0 ;;
+      *ABS_MT_TRACKING_ID*) case "$line" in *ffffffff*) DOWN=0;; *) DOWN=1;; esac ;;
+    esac
+    case "$X$Y" in *[!0-9-]*) continue;; esac
+    [ "$X" -lt 0 ] || [ "$Y" -lt 0 ] && continue
+    # device coords -> canvas coords
+    CX=$(( X * W / MAXX ))
+    CY=$(( Y * H / MAXY ))
+    if [ "$DOWN" = "1" ] && { [ "$CX" != "$LX" ] || [ "$CY" != "$LY" ]; }; then
+      LX=$CX; LY=$CY
+      touch "$HB"
+      sh "$BIN/maxregner-screen" tap "$CX" "$CY" "$W" "$H" >> "$LOG" 2>&1
+    fi
+  done
+}
+
+case "$1" in
+  loop) loop "$2" "$3" ;;
+  *) echo "usage: maxregner-input loop <w> <h>"; exit 1 ;;
+esac

@@ -1,0 +1,118 @@
+#!/system/bin/sh
+# MaxRegnerOS — app drawer daemon: paint once, then serve touch.
+#
+# Tap a row  -> launch that app, wait for it to leave the foreground, repaint.
+# Swipe      -> scroll the list and repaint.
+# Vol keys   -> scroll.
+#
+# The daemon deliberately exits after a launch returns, so a supervisor
+# (service.sh or the action button) can decide whether the drawer comes back.
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+
+GID="$1"
+FB=$(app_fbdev)
+set -- $(fb_geom)
+VW="$1"; VH="$2"
+[ -z "$GID" ] && GID=$(geom_id "$VW" "$VH")
+[ -z "$GID" ] && { echo "appd: no geometry profile for ${VW}x${VH}"; exit 3; }
+geom_load "$GID" || exit 3
+
+[ -s "$REGTSV" ] || { echo "appd: registry empty; run 'maxregner-apps sync' first"; exit 4; }
+
+TOTAL=$(grep -c . "$REGTSV")
+SCROLL=0
+MAXSCROLL=$((TOTAL - GVIS))
+[ "$MAXSCROLL" -lt 0 ] && MAXSCROLL=0
+
+PIDF="$RUN/appd.pid"
+echo $$ > "$PIDF"
+applog "appd: start geom=$GID total=$TOTAL"
+
+redraw() {
+  sh "$(dirname "$0")/maxregner-appdraw" "$GID" "$SCROLL" >/dev/null 2>&1
+}
+
+# ── touch mapping ────────────────────────────────────────────
+TMAX_X=$(conf_get TOUCH_MAX_X); TMAX_Y=$(conf_get TOUCH_MAX_Y)
+[ -z "$TMAX_X" ] || [ "$TMAX_X" = "0" ] && TMAX_X="$VW"
+[ -z "$TMAX_Y" ] || [ "$TMAX_Y" = "0" ] && TMAX_Y="$VH"
+
+row_at() {
+  local y="$1"
+  local rel=$((y - GLISTY))
+  [ "$rel" -lt 0 ] && { echo -1; return; }
+  local r=$((rel / GBAND))
+  [ "$r" -ge "$GVIS" ] && { echo -1; return; }
+  local idx=$((SCROLL + r))
+  [ "$idx" -ge "$TOTAL" ] && { echo -1; return; }
+  echo "$idx"
+}
+
+wait_for_leave() {
+  # poll the resumed activity until the app we launched is no longer it
+  local pkg="$1" i=0 cur=""
+  while [ "$i" -lt 120 ]; do
+    cur=$(dumpsys activity activities 2>/dev/null | grep -m1 'mResumedActivity' | awk '{print $NF}')
+    case "$cur" in
+      "$pkg"/*) : ;;
+      "") : ;;
+      *) return 0 ;;
+    esac
+    i=$((i + 1))
+    sleep 1
+  done
+  return 0
+}
+
+redraw
+
+last_act=0
+x=0; y=0; down_x=0; down_y=0; touching=0
+
+getevent -lt 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *ABS_MT_POSITION_X*) x=$((0x$(printf '%s' "$line" | awk '{print $NF}'))) ;;
+    *ABS_MT_POSITION_Y*) y=$((0x$(printf '%s' "$line" | awk '{print $NF}'))) ;;
+    *BTN_TOUCH*DOWN*)
+      down_x=$x; down_y=$y; touching=1 ;;
+    *BTN_TOUCH*UP*)
+      touching=0
+      [ "$TMAX_X" != "$VW" ] && x=$((x * VW / TMAX_X))
+      [ "$TMAX_Y" != "$VH" ] && y=$((y * VH / TMAX_Y))
+      dx=$((x - down_x)); dy=$((y - down_y))
+      ax=${dx#-}; ay=${dy#-}
+      now=$(date +%s)
+      [ $((now - last_act)) -lt 1 ] && continue
+      last_act=$now
+      if [ "$ax" -lt 60 ] && [ "$ay" -lt 60 ]; then
+        idx=$(row_at "$y")
+        applog "tap $x,$y -> row $idx"
+        if [ "$idx" -ge 0 ]; then
+          pkg=$(awk -v n="$((idx + 1))" 'NR==n{print $1; exit}' "$REGTSV")
+          comp=$(awk -v n="$((idx + 1))" 'NR==n{print $3; exit}' "$REGTSV")
+          if [ -n "$pkg" ]; then
+            sh "$(dirname "$0")/maxregner-launch" "$pkg" "$comp"
+            wait_for_leave "$pkg"
+            redraw
+          fi
+        fi
+      elif [ "$ay" -gt 80 ]; then
+        if [ "$dy" -lt 0 ]; then
+          SCROLL=$((SCROLL + 1)); [ "$SCROLL" -gt "$MAXSCROLL" ] && SCROLL=$MAXSCROLL
+        else
+          SCROLL=$((SCROLL - 1)); [ "$SCROLL" -lt 0 ] && SCROLL=0
+        fi
+        applog "scroll -> $SCROLL"
+        redraw
+      fi
+      ;;
+    *KEY_VOLUMEUP*DOWN*)
+      SCROLL=$((SCROLL - 1)); [ "$SCROLL" -lt 0 ] && SCROLL=0; redraw ;;
+    *KEY_VOLUMEDOWN*DOWN*)
+      SCROLL=$((SCROLL + 1)); [ "$SCROLL" -gt "$MAXSCROLL" ] && SCROLL=$MAXSCROLL; redraw ;;
+  esac
+done
+
+rm -f "$PIDF"
+applog "appd: exit"

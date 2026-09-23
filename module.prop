@@ -1,0 +1,6 @@
+id=maxregner
+name=MaxRegnerOS Cloud Avatar
+version=v2.1.0-ci
+versionCode=21000
+author=MaxRegner
+description=MaxRegnerOS takeover shell with app drawer, adaptive geometry and multi-ABI native client. CI-built.

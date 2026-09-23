@@ -1,0 +1,9 @@
+ro.product.brand=MaxRegner
+ro.product.manufacturer=MaxRegner
+ro.product.model=MaxRegnerOS
+ro.product.name=maxregneros
+ro.product.device=maxregneros
+ro.build.display.id=MaxRegnerOS Cloud Avatar Edition
+ro.build.version.incremental=maxregner.2.0.0
+ro.maxregner.version=2.0.0
+ro.maxregner.build=cloudavatar

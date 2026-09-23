@@ -1,0 +1,17 @@
+#!/system/bin/sh
+# Bootloop guard. Any volume-key hold during boot disables the takeover.
+MR=/data/adb/maxregner
+STATE="$MR/state"
+LOG="$MR/log/safemode.log"
+mkdir -p "$STATE"
+
+# a long volume-down hold at boot = user wants stock Android
+i=0
+while [ "$i" -lt 12 ]; do
+  v=$(getevent -qlc 1 2>/dev/null | head -20)
+  echo "$v" | grep -q "KEY_VOLUMEDOWN.*DOWN" && {
+    echo "$(date) volume-down at boot -> safemode" >> "$LOG"
+    touch "$STATE/safemode"; exit 0; }
+  i=$((i + 1)); sleep 1
+done
+exit 0

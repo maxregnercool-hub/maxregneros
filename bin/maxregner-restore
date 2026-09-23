@@ -1,0 +1,21 @@
+#!/system/bin/sh
+# Full restore to stock Android.
+MR=/data/adb/maxregner
+MODDIR=/data/adb/modules/maxregner
+LOG="$MR/log/restore.log"
+echo "[$(date)] restore requested" >> "$LOG"
+
+sh "$MODDIR/bin/maxregner-takeover" restore >> "$LOG" 2>&1
+
+# bring the stock shell back
+for p in com.android.systemui com.google.android.apps.nexuslauncher \
+         com.android.launcher3 com.sec.android.app.launcher com.miui.home; do
+  am start -n "$p/.Launcher" 2>/dev/null
+done
+cmd package set-home-activity com.google.android.apps.nexuslauncher/.NexusLauncherActivity 2>/dev/null
+settings put global policy_control null 2>/dev/null
+settings delete secure immersive_mode_confirmations 2>/dev/null
+
+rm -f "$MR/state/safemode" "$MR/state/takeover_on" 2>/dev/null
+echo "stock Android restored" >> "$LOG"
+echo "restored. reboot recommended."

@@ -1,0 +1,69 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      ndk_version:
+        description: Android NDK version
+        required: false
+        default: r26b
+
+jobs:
+  android:
+    name: android ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            api: 29
+            triple: aarch64-linux-android
+          - abi: armeabi-v7a
+            api: 21
+            triple: armv7a-linux-androideabi
+          - abi: x86_64
+            api: 29
+            triple: x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install NDK
+        run: |
+          NDK_VER="${{ github.event.inputs.ndk_version || 'r26b' }}"
+          echo "installing NDK $NDK_VER"
+          wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip"
+          unzip -q "android-ndk-${NDK_VER}-linux.zip"
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-${NDK_VER}" >> "$GITHUB_ENV"
+
+      - name: build ${{ matrix.abi }}
+        working-directory: payload/client/src
+        env:
+          ABI: ${{ matrix.abi }}
+          API: ${{ matrix.api }}
+        run: sh build.sh --ndk
+
+      - name: verify ELF class and machine
+        working-directory: payload/client/src
+        run: |
+          BIN="build/${{ matrix.abi }}/mrca-client"
+          file "$BIN"
+          echo "--- header ---"
+          readelf -h "$BIN" | grep -E 'Class|Machine|Type'
+          echo "--- dynamic (expect static) ---"
+          if readelf -d "$BIN" >/dev/null 2>&1; then
+            readelf -d "$BIN" | head -5
+          else
+            echo "no dynamic section - static"
+          fi
+
+      - name: size report
+        working-directory: payload/client/src
+        run: ls -lh "build/${{ matrix.abi }}/mrca-client"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mrca-client-${{ matrix.abi }}
+          path: payload/client/src/build/${{ matrix.abi }}/mrca-client

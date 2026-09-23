@@ -1,0 +1,134 @@
+#!/system/bin/sh
+# MaxRegnerOS — build the installed-app registry.
+#
+# This is the component that turns every installed app into a MaxRegner app:
+# enumerate packages -> resolve each launcher component -> derive a label and
+# a deterministic accent -> pre-composite a full-width row strip.
+#
+#   maxregner-appsync             detect geometry, incremental sync
+#   maxregner-appsync --geom P1   prebuild for a profile
+#   maxregner-appsync --force     rebuild every row, ignore cache
+#   maxregner-appsync --list      print the registry
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+
+FORCE=0; FG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) FORCE=1 ;;
+    --geom)  shift; FG="$1" ;;
+    --list)
+      [ -f "$REGTSV" ] || { echo "no registry yet — run: maxregner-apps sync"; exit 1; }
+      printf '%-8s %-28s %s\n' "LETTER" "LABEL" "PACKAGE"
+      awk -F'\t' '{printf "%-8s %-28s %s\n", $5, substr($2,1,28), $1}' "$REGTSV"
+      echo ""
+      echo "$(grep -c . "$REGTSV") apps indexed"
+      exit 0 ;;
+  esac
+  shift
+done
+
+mkdir -p "$APPSROOT" "$BANDS"
+
+set -- $(fb_geom)
+VW="$1"; VH="$2"
+GID=$(geom_id "$VW" "$VH")
+[ -n "$FG" ] && GID="$FG"
+if [ -z "$GID" ]; then
+  applog "sync: unsupported panel ${VW}x${VH}"
+  echo "sync: no geometry profile matches ${VW}x${VH}"
+  echo "      shipped profiles: $(awk -F'\t' '!/^#/&&NF>2{printf "%s(%sx%s) ",$1,$2,$3}' "$MASSETS/geom.tsv")"
+  echo "      pass --geom P1 to prebuild anyway"
+  exit 3
+fi
+geom_load "$GID" || { echo "sync: cannot load $GID"; exit 3; }
+
+echo "MaxRegnerOS app sync"
+echo "  geometry : $GID  ${GW}x${GH}  stride $GSTRIDE  row $GBAND  visible $GVIS"
+echo "  cache    : $BANDS"
+echo ""
+
+P3LIST=$(pm list packages -3 2>/dev/null | sed 's/^package://' | sort)
+SYS=$(pm list packages -s 2>/dev/null | sed 's/^package://' | sort)
+ALL=$(printf '%s\n%s\n' "$P3LIST" "$SYS" | grep -v '^$' | sort -u)
+TOTAL=$(printf '%s\n' "$ALL" | grep -cv '^$')
+echo "  installed: $TOTAL packages"
+
+PIDX="$APPSROOT/bandindex.tsv"
+[ "$FORCE" = "1" ] && rm -f "$PIDX"
+[ -f "$PIDX" ] || : > "$PIDX"
+
+TMP="$APPSROOT/.reg.tmp"
+JBODY="$APPSROOT/.regjson.tmp"
+: > "$TMP"; : > "$JBODY"
+n=0; built=0; skipped=0; reused=0
+
+echo "  resolving launcher entries..."
+printf '%s\n' "$ALL" | while IFS= read -r pkg; do
+  [ -z "$pkg" ] && continue
+
+  comp=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER "$pkg" 2>/dev/null | tail -n1)
+  case "$comp" in */*) : ;; *) continue ;; esac
+
+  lbl=""
+  [ -f "$LABELOVR" ] && lbl=$(awk -F'\t' -v p="$pkg" '$1==p{print $2; exit}' "$LABELOVR")
+  if [ -z "$lbl" ]; then
+    lbl=$(dumpsys package "$pkg" 2>/dev/null | tr ' ' '\n' \
+          | grep -m1 '^nonLocalizedLabel=' | cut -d= -f2-)
+  fi
+  case "$lbl" in ""|null) lbl="" ;; esac
+  [ -z "$lbl" ] && lbl=$(humanise_pkg "$pkg")
+
+  is3=$(printf '%s\n' "$P3LIST" | grep -qx "$pkg" && echo 1 || echo 0)
+  hue=$(hue_for "$pkg")
+  let=$(letter_for "$lbl")
+  key="${pkg}|${hue}|${lbl}|${GID}"
+  bp=$(band_path "$pkg")
+
+  if [ "$FORCE" != "1" ] && grep -qF "$key" "$PIDX" 2>/dev/null && [ -s "$bp" ]; then
+    reused=$((reused + 1))
+  else
+    sh "$(dirname "$0")/maxregner-bandbuild" "$GID" "$bp" "$hue" "$let" "$lbl" "$pkg" 2>/dev/null
+    if [ -s "$bp" ]; then
+      grep -vF "${pkg}|" "$PIDX" > "$PIDX.2" 2>/dev/null || : > "$PIDX.2"
+      printf '%s\t%s\n' "$key" "$bp" >> "$PIDX.2"
+      mv -f "$PIDX.2" "$PIDX"
+      built=$((built + 1))
+    else
+      skipped=$((skipped + 1)); continue
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pkg" "$lbl" "$comp" "$hue" "$let" "$is3" >> "$TMP"
+  exc=$(printf '%s' "$lbl" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  exp=$(printf '%s' "$pkg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"pkg":"%s","label":"%s","component":"%s","hue":%s,"letter":"%s","system":%s}' \
+     "$exp" "$exc" "$comp" "$hue" "$let" "$is3" >> "$JBODY"
+
+  n=$((n + 1))
+  printf '%s/%s' "$n" "$TOTAL" > "$PROGRESS"
+  echo "    [$n] $lbl"
+done
+
+[ -s "$TMP" ] && cp -f "$TMP" "$REGTSV"
+CNT=$(grep -c . "$REGTSV" 2>/dev/null); [ -z "$CNT" ] && CNT=0
+
+{
+  printf '{\n'
+  printf '  "generated": %s,\n' "$(date +%s)"
+  printf '  "geometry": "%s",\n' "$GID"
+  printf '  "canvas": [%s, %s],\n' "$GW" "$GH"
+  printf '  "count": %s,\n' "$CNT"
+  printf '  "apps": [\n'
+  if [ -s "$JBODY" ]; then
+    awk 'BEGIN{f=1} {if(!f) printf ",\n"; f=0; printf "    %s", $0}' "$JBODY"
+    printf '\n'
+  fi
+  printf '  ]\n}\n'
+} > "$REGJSON"
+
+rm -f "$TMP" "$JBODY" "$PROGRESS"
+echo ""
+echo "  indexed  : $CNT apps"
+echo "  rows     : $built built, $reused reused, $skipped unrenderable"
+applog "sync: $GID indexed=$CNT built=$built reuse=$reused skip=$skipped"

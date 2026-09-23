@@ -1,0 +1,6 @@
+64 600 524 810 app:messages
+556 600 1016 810 app:camera
+64 842 524 1052 app:gallery
+556 842 1016 1052 app:files
+64 1084 524 1294 app:browser
+556 1084 1016 1294 app:settings

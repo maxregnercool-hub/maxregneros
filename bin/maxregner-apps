@@ -1,0 +1,114 @@
+#!/system/bin/sh
+# MaxRegnerOS — app registry control plane.
+#
+#   maxregner-apps sync [--force] [--geom P1]  build/refresh the registry
+#   maxregner-apps list                        print indexed apps
+#   maxregner-apps draw [scroll]               paint the drawer once
+#   maxregner-apps run                         start the drawer daemon
+#   maxregner-apps stop                        stop the drawer daemon
+#   maxregner-apps launch <pkg|--index n|--label x>
+#   maxregner-apps search <text>               search indexed apps
+#   maxregner-apps status                      registry + runtime state
+#   maxregner-apps label <pkg> <name>          override a display label
+#   maxregner-apps forget                      drop bands for uninstalled apps
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+BIN=$(dirname "$0")
+
+case "$1" in
+  sync)   shift; sh "$BIN/maxregner-appsync" "$@" ;;
+
+  list)   sh "$BIN/maxregner-appsync" --list ;;
+
+  search)
+    [ -s "$REGTSV" ] || { echo "no registry"; exit 1; }
+    awk -F'\t' -v q="$2" 'tolower($1) ~ tolower(q) || tolower($2) ~ tolower(q) \
+        {printf "%-30s %-22s %s\n", $2, $1, $5}' "$REGTSV"
+    ;;
+
+  draw)
+    set -- $(fb_geom)
+    GID=$(geom_id "$1" "$2")
+    [ -z "$GID" ] && { echo "unsupported panel $1x$2"; exit 3; }
+    sh "$BIN/maxregner-appdraw" "$GID" "${3:-0}"
+    ;;
+
+  run)
+    PIDF="$RUN/appd.pid"
+    if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+      echo "already running (pid $(cat "$PIDF"))"; exit 0
+    fi
+    set -- $(fb_geom)
+    GID=$(geom_id "$1" "$2")
+    [ -z "$GID" ] && { echo "unsupported panel $1x$2"; exit 3; }
+    echo "starting drawer daemon on $GID"
+    nohup sh "$BIN/maxregner-appd" "$GID" >/dev/null 2>&1 &
+    ;;
+
+  stop)
+    PIDF="$RUN/appd.pid"
+    if [ -f "$PIDF" ]; then
+      kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+      rm -f "$PIDF"
+      echo "drawer daemon stopped"
+    else
+      echo "not running"
+    fi
+    ;;
+
+  launch) shift; sh "$BIN/maxregner-launch" "$@" ;;
+
+  label)
+    PKG="$2"; NAME="$3"
+    [ -z "$PKG" ] || [ -z "$NAME" ] && { echo "usage: maxregner-apps label <pkg> <name>"; exit 2; }
+    mkdir -p "$APPSROOT"
+    [ -f "$LABELOVR" ] || : > "$LABELOVR"
+    grep -v "^$PKG	" "$LABELOVR" > "$LABELOVR.2" 2>/dev/null || : > "$LABELOVR.2"
+    printf '%s\t%s\n' "$PKG" "$NAME" >> "$LABELOVR.2"
+    mv -f "$LABELOVR.2" "$LABELOVR"
+    echo "label set: $PKG -> $NAME (run 'maxregner-apps sync --force')"
+    ;;
+
+  forget)
+    KEEP=0; DROP=0
+    for f in "$BANDS"/*.raw; do
+      [ -f "$f" ] || continue
+      if grep -qF "$f" "$REGTSV" 2>/dev/null; then KEEP=$((KEEP + 1)); else rm -f "$f"; DROP=$((DROP + 1)); fi
+    done
+    echo "band cache: $KEEP kept, $DROP dropped"
+    ;;
+
+  status)
+    echo "MaxRegnerOS app registry"
+    echo "-----------------------"
+    set -- $(fb_geom)
+    VW="$1"; VH="$2"; VB="$3"; VS="$4"
+    GID=$(geom_id "$VW" "$VH")
+    echo "panel        : ${VW}x${VH} ${VB}bpp stride ${VS}"
+    echo "geometry     : ${GID:-UNSUPPORTED}"
+    [ -n "$GID" ] && { geom_load "$GID"; echo "rows visible : $GVIS of $((GH / GBAND))"; }
+    echo "assets       : $MASSETS"
+    echo "registry     : $REGTSV"
+    if [ -s "$REGTSV" ]; then
+      echo "indexed apps : $(grep -c . "$REGTSV")"
+      echo "third-party  : $(awk -F'\t' '$6==1' "$REGTSV" | grep -c .)"
+      echo "system       : $(awk -F'\t' '$6==0' "$REGTSV" | grep -c .)"
+    else
+      echo "indexed apps : 0  (run 'maxregner-apps sync')"
+    fi
+    n=0
+    for f in "$BANDS"/*.raw; do [ -f "$f" ] && n=$((n + 1)); done
+    echo "cached rows  : $n"
+    echo "assets found : $(ls "$MASSETS/fonts" 2>/dev/null | grep -c . ) font files, $(ls "$MASSETS/avatars" 2>/dev/null | grep -c .) tiles"
+    PIDF="$RUN/appd.pid"
+    if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+      echo "daemon       : RUNNING (pid $(cat "$PIDF"))"
+    else
+      echo "daemon       : stopped"
+    fi
+    ;;
+
+  *)
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2 ;;
+esac

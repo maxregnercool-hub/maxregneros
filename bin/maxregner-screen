@@ -1,0 +1,121 @@
+#!/system/bin/sh
+# MaxRegnerOS display engine.
+# Screens are raw RGB565. A band is a CONTIGUOUS ROW RANGE, so a repaint is
+# ONE dd of bs=stride — not one syscall per byte.
+MR=/data/adb/maxregner
+ADB=/data/adb/modules/maxregner
+SC="$MR/screens"
+TMP="$MR/state/_band.raw565"
+LOG="$MR/log/screen.log"
+mkdir -p "$SC" "$MR/state"
+log(){ echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
+
+fbdev(){
+  for c in /dev/graphics/fb0 /dev/graphics/fb1; do [ -e "$c" ] && { echo "$c"; return 0; }; done
+  for c in /dev/dri/card0 /dev/dri/card1; do [ -e "$c" ] && { echo "$c"; return 0; }; done
+  return 1
+}
+
+# dd with blocks of `bs`, writing N blocks at row R of the panel
+blit(){
+  # blit <src> <rowsrc_start> <rowdst_start> <nrows> <stride> <fb>
+  dd if="$1" of="$6" bs="$5" skip="$2" seek="$3" count="$4" conv=notrunc 2>/dev/null
+}
+
+present(){
+  NAME=$1; W=$2; H=$3
+  D="$SC/${W}x${H}"
+  SRC="$D/$NAME.raw565"
+  if [ ! -f "$SRC" ]; then
+    log "missing screen $NAME at ${W}x${H}"
+    return 1
+  fi
+  FB=$(fbdev)
+  if [ -z "$FB" ]; then log "no display node"; return 1; fi
+  STRIDE=$((W * 2))
+  blit "$SRC" 0 0 "$H" "$STRIDE" "$FB" || { log "blit failed"; return 1; }
+  echo "$NAME" > "$MR/state/current_screen"
+  log "presented $NAME (${W}x${H})"
+  return 0
+}
+
+# repaint only the rows a changed region occupies
+band(){
+  NAME=$1; R1=$2; R2=$3; W=$4; D="$SC/${W}x${H}"
+  SRC="$D/$NAME.raw565"
+  [ -f "$SRC" ] || return 1
+  STRIDE=$((W * 2)); N=$((R2 - R1))
+  [ "$N" -le 0 ] && return 0
+  FB=$(fbdev); [ -z "$FB" ] && return 1
+  # slice rows out of the cached screen, then write them back
+  dd if="$SRC" of="$TMP" bs="$STRIDE" skip="$R1" count="$N" 2>/dev/null
+  blit "$TMP" 0 "$R1" "$N" "$STRIDE" "$FB"
+  return 0
+}
+
+# resolve what a tap should do, return target screen (or -)
+resolve(){
+  NAME=$1; CX=$2; CY=$3; W=$4; H=$5
+  R="$SC/${W}x${H}/$NAME.regions"
+  [ -f "$R" ] || { echo "-"; return; }
+  while read -r x1 y1 x2 y2 act; do
+    case "$x1" in ''|'#'*) continue;; esac
+    if [ "$CX" -ge "$x1" ] && [ "$CX" -le "$x2" ] && \
+       [ "$CY" -ge "$y1" ] && [ "$CY" -le "$y2" ]; then
+      case "$act" in
+        app:*)     echo "apps" ;;
+        row:about|info:*) echo "about" ;;
+        row:*)     echo "settings" ;;
+        *)         echo "-" ;;
+      esac
+      return
+    fi
+  done < "$R"
+  echo "-"
+}
+
+tap(){
+  CX=$1; CY=$2; W=$3; H=$4
+  CUR=$(cat "$MR/state/current_screen" 2>/dev/null)
+  [ -z "$CUR" ] && CUR=home
+  TGT=$(resolve "$CUR" "$CX" "$CY" "$W" "$H")
+  log "tap $CX,$CY on $CUR -> $TGT"
+  if [ "$TGT" != "-" ] && [ "$TGT" != "$CUR" ]; then
+    present "$TGT" "$W" "$H"
+  else
+    # same screen: flash the accent band for feedback
+    R1=$(( CY - 4 )); R2=$(( CY + 4 ))
+    [ "$R1" -lt 0 ] && R1=0
+    [ "$R2" -gt "$H" ] && R2=$H
+    band "$CUR" "$R1" "$R2" "$W"
+  fi
+}
+
+build(){
+  W=$1; H=$2
+  D="$SC/${W}x${H}"
+  mkdir -p "$D"
+  PRE="$ADB/screens/${W}x${H}"
+  if [ -d "$PRE" ]; then
+    cp -f "$PRE"/* "$D"/ 2>/dev/null
+    log "installed prebuilt screens ${W}x${H}"
+    return 0
+  fi
+  # geometry not prebuilt: render on-device with the adaptive rasterizer
+  if [ -x "$ADB/bin/mrca-raster" ]; then
+    log "rendering on-device at ${W}x${H}"
+    sh "$ADB/bin/mrca-raster" build "$W" "$H" "$D" >> "$LOG" 2>&1
+  else
+    log "no prebuilt screens and no rasterizer for ${W}x${H}"
+    return 1
+  fi
+}
+
+case "$1" in
+  present) present "$2" "$3" "$4" ;;
+  tap)     tap "$2" "$3" "$4" "$5" ;;
+  band)    band "$2" "$3" "$4" "$5" ;;
+  build)   build "$2" "$3" ;;
+  geom)    cat "$MR/state/geom" 2>/dev/null ;;
+  *) echo "usage: maxregner-screen {present|tap|band|build} ..."; exit 1 ;;
+esac

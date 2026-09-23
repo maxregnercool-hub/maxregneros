@@ -1,0 +1,316 @@
+#!/system/bin/sh
+# MaxRegnerOS Cloud Avatar — fallback runtime.
+#
+# No compiler, no Python, no Termux. Uses only applets that every Android
+# build already ships: toybox dd, getevent, cat, awk.
+#
+# The architecture is the real one, just with the renderer moved offline:
+# the "avatar" (the asset set) decides every pixel; this process only
+# (a) pushes those pixels at the panel and (b) forwards touch upstream into
+# the hit-tester. That is a thin client in the strict sense.
+#
+# HONEST LIMITS, stated up front because they matter:
+#   * It needs an EXACT geometry+format match against a prebuilt screen.
+#     Android panels vary too much to cover every case; unmatched devices
+#     get diagnostics instead of pixels and should build the native daemon.
+#   * /dev/graphics/fb0 is only the live scanout on devices that still
+#     expose the legacy framebuffer. On DRM-only devices the framework must
+#     first be stopped ('maxregner-ctl takeover'). The native client drives
+#     DRM/KMS directly and does not need that.
+
+DATADIR=/data/adb/maxregner
+CONF="$DATADIR/ca.conf"
+RUN="$DATADIR/run"
+LOG="$DATADIR/logs/ui.log"
+
+MODDIR=""
+[ -f "$RUN/modpath" ] && MODDIR=$(cat "$RUN/modpath")
+[ -z "$MODDIR" ] && MODDIR=/data/adb/modules/MaxRegnerOSCloudAvatar
+ASSETS="$MODDIR/assets/ui"
+INDEX="$ASSETS/index.tsv"
+
+log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
+
+conf_get() { [ -f "$CONF" ] && grep -m1 "^$1=" "$CONF" 2>/dev/null | cut -d= -f2; }
+
+# ── display geometry ─────────────────────────────────────────────
+FBDEV=""
+for cand in /dev/graphics/fb0 /dev/fb0 /dev/fb/0; do
+  [ -e "$cand" ] && { FBDEV="$cand"; break; }
+done
+
+fb_geom() {
+  # echoes "W H BPP STRIDE"
+  local w="" h="" bpp="" stride=""
+  if [ -r /sys/class/graphics/fb0/virtual_size ]; then
+    local vs
+    vs=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+    w=${vs%,*}; h=${vs#*,}
+  fi
+  [ -r /sys/class/graphics/fb0/bits_per_pixel ] && \
+    bpp=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
+  [ -r /sys/class/graphics/fb0/stride ] && \
+    stride=$(cat /sys/class/graphics/fb0/stride 2>/dev/null)
+  # some kernels expose stride in pixels, some in bytes; normalise later
+  [ -z "$bpp" ] && bpp=32
+  [ -z "$stride" ] && [ -n "$w" ] && stride=$((w * bpp / 8))
+  echo "$w $h $bpp $stride"
+}
+
+fmt_for_bpp() {
+  case "$1" in
+    16) echo "rgb565" ;;
+    32) echo "bgra8888" ;;
+    *)  echo "unsupported" ;;
+  esac
+}
+
+# ── asset lookup ─────────────────────────────────────────────────
+# index.tsv: screen <TAB> WxH <TAB> format <TAB> bpp <TAB> stride <TAB> file
+find_asset() {
+  local screen="$1" geom="$2" fmt="$3"
+  [ -f "$INDEX" ] || return 1
+  awk -F'\t' -v s="$screen" -v g="$geom" -v f="$fmt" \
+      '$1==s && $2==g && $3==f { print $6; exit }' "$INDEX"
+}
+
+# ── blit ─────────────────────────────────────────────────────────
+# Whole-screen write in one dd. Row padding is handled by making the block
+# size the stride and the count the height, so a padded panel still lands
+# correctly as long as the asset's stride matches the panel's.
+blit() {
+  local file="$1" stride="$2" h="$3"
+  [ -f "$file" ] || { log "blit: missing $file"; return 1; }
+  [ -w "$FBDEV" ] || { log "blit: $FBDEV not writable"; return 1; }
+  dd if="$file" of="$FBDEV" bs="$stride" count="$h" conv=notrunc 2>/dev/null
+  return $?
+}
+
+# ── hit testing ──────────────────────────────────────────────────
+# Regions are fractions of the panel in per-mille, so the same table works
+# at every resolution the assets cover.
+# args: screen x y W H  -> echoes action
+hit_test() {
+  local scr="$1" x="$2" y="$3" W="$4" H="$5"
+  local xm=$((x * 1000 / W))
+  local ym=$((y * 1000 / H))
+
+  # bottom navigation bar, always live
+  if [ "$ym" -ge 944 ]; then
+    if   [ "$xm" -lt 333 ]; then echo "home"
+    elif [ "$xm" -lt 666 ]; then echo "apps"
+    else                         echo "settings"
+    fi
+    return
+  fi
+
+  case "$scr" in
+    home)
+      # 3x2 tile grid between y=270 and y=760 per-mille
+      if [ "$ym" -ge 265 ] && [ "$ym" -lt 760 ]; then
+        local row col
+        if [ "$ym" -lt 510 ]; then row=0; else row=1; fi
+        if   [ "$xm" -lt 340 ]; then col=0
+        elif [ "$xm" -lt 670 ]; then col=1
+        else                         col=2
+        fi
+        # tiles are ordered Terminal Files Monitor / Browser Notes Settings
+        echo "tile:$((row * 3 + col))"
+        return
+      fi
+      ;;
+    apps)
+      if [ "$ym" -ge 90 ] && [ "$ym" -lt 900 ]; then
+        local idx=$(( (ym - 90) * 12 / 810 ))
+        [ "$idx" -gt 11 ] && idx=11
+        echo "row:$idx"
+        return
+      fi
+      ;;
+    settings)
+      if [ "$ym" -ge 90 ] && [ "$ym" -lt 620 ]; then
+        local t=$(( (ym - 90) * 4 / 530 ))
+        [ "$t" -gt 3 ] && t=3
+        echo "toggle:$t"
+        return
+      fi
+      if [ "$ym" -ge 660 ] && [ "$ym" -lt 780 ]; then
+        echo "slider"
+        return
+      fi
+      ;;
+  esac
+  echo "none"
+}
+
+do_action() {
+  local act="$1"
+  case "$act" in
+    home)     set_screen home ;;
+    apps)     set_screen apps ;;
+    settings) set_screen settings ;;
+    tile:*)   # a tile opens the apps list as its "page" for now
+              set_screen apps ;;
+    row:*)    : ;;
+    toggle:*) : ;;
+    slider)   : ;;
+    *)        : ;;
+  esac
+}
+
+CUR=""
+set_screen() {
+  local scr="$1"
+  local geom="$2" fmt="$3" stride="$4" h="$5"
+  [ -z "$geom" ] && read geom fmt stride h <<EOF
+$(geom_and_fmt)
+EOF
+  local f
+  f=$(find_asset "$scr" "$geom" "$fmt")
+  if [ -z "$f" ]; then
+    log "no asset for $scr $geom $fmt"
+    return 1
+  fi
+  blit "$ASSETS/$f" "$stride" "$h"
+  CUR="$scr"
+  log "screen -> $scr ($f)"
+  return 0
+}
+
+geom_and_fmt() {
+  read gw gh gb gs <<EOF
+$(fb_geom)
+EOF
+  local f; f=$(fmt_for_bpp "$gb")
+  echo "$gw"x"$gh" "$f" "$gs" "$gh"
+}
+
+# ── input ────────────────────────────────────────────────────────
+run_input() {
+  local W="$1" H="$2" stride="$3" hh="$4" fmt="$5" geom="$6"
+  local tmax_x tmax_y
+  tmax_x=$(conf_get TOUCH_MAX_X); tmax_y=$(conf_get TOUCH_MAX_Y)
+  [ -z "$tmax_x" ] || [ "$tmax_x" = "0" ] && tmax_x="$W"
+  [ -z "$tmax_y" ] || [ "$tmax_y" = "0" ] && tmax_y="$H"
+
+  log "input loop start (panel ${W}x${H}, touch ${tmax_x}x${tmax_y})"
+  local x=0 y=0 last=0 now
+
+  getevent -lt 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *ABS_MT_POSITION_X*)
+        x=$((0x$(echo "$line" | awk '{print $NF}')))
+        ;;
+      *ABS_MT_POSITION_Y*)
+        y=$((0x$(echo "$line" | awk '{print $NF}')))
+        ;;
+      *SYN_REPORT*)
+        [ "$tmax_x" -gt 0 ] 2>/dev/null && [ "$tmax_x" != "$W" ] && x=$((x * W / tmax_x))
+        [ "$tmax_y" -gt 0 ] 2>/dev/null && [ "$tmax_y" != "$H" ] && y=$((y * H / tmax_y))
+        now=$(date +%s)
+        if [ $((now - last)) -ge 1 ]; then
+          last=$now
+          act=$(hit_test "$CUR" "$x" "$y" "$W" "$H")
+          log "tap $x,$y on $CUR -> $act"
+          do_action "$act" "$geom" "$fmt" "$stride" "$hh"
+        fi
+        ;;
+      *KEY_VOLUMEUP*)
+        set_screen "$(next_screen "$CUR")" "$geom" "$fmt" "$stride" "$hh"
+        ;;
+    esac
+  done
+}
+
+next_screen() {
+  case "$1" in
+    home) echo apps ;;
+    apps) echo settings ;;
+    *)    echo home ;;
+  esac
+}
+
+# ── commands ─────────────────────────────────────────────────────
+cmd_info() {
+  read W H BPP STRIDE <<EOF
+$(fb_geom)
+EOF
+  FMT=$(fmt_for_bpp "$BPP")
+  echo "MaxRegnerOS Cloud Avatar — display probe"
+  echo "----------------------------------------"
+  echo "framebuffer node : ${FBDEV:-NOT FOUND}"
+  echo "geometry         : ${W:-?} x ${H:-?}"
+  echo "bits per pixel   : ${BPP:-?}"
+  echo "stride           : ${STRIDE:-?} bytes"
+  echo "asset format     : $FMT"
+  echo "asset index      : $INDEX"
+  echo ""
+  if [ -z "$W" ] || [ -z "$H" ]; then
+    echo "Result: could not read panel geometry."
+    echo "        /sys/class/graphics/fb0 is empty or absent."
+    echo "        This device likely uses DRM only; build the native daemon."
+    return 2
+  fi
+  echo "Prebuilt screens available for this panel:"
+  local any=0
+  for s in home apps settings; do
+    f=$(find_asset "$s" "${W}x${H}" "$FMT")
+    if [ -n "$f" ]; then
+      echo "  $s -> $f"
+      any=1
+    fi
+  done
+  if [ "$any" = "0" ]; then
+    echo "  (none)"
+    echo ""
+    echo "Result: no exact match for ${W}x${H} / $FMT."
+    echo "        Shipped profiles:"
+    [ -f "$INDEX" ] && awk -F'\t' '!/^#/ {print "          "$2" "$3}' "$INDEX" | sort -u
+    echo "        Build the native daemon for full support on this panel."
+    return 3
+  fi
+  echo ""
+  echo "Result: this panel is fully supported by the fallback runtime."
+  return 0
+}
+
+cmd_show() {
+  read gw gh gb gs <<EOF
+$(fb_geom)
+EOF
+  f=$(fmt_for_bpp "$gb")
+  set_screen "${1:-home}" "${gw}x${gh}" "$f" "$gs" "$gh"
+}
+
+cmd_run() {
+  read W H BPP STRIDE <<EOF
+$(fb_geom)
+EOF
+  FMT=$(fmt_for_bpp "$BPP")
+  if [ -z "$W" ] || [ -z "$H" ]; then
+    log "run: no usable framebuffer"
+    echo "no usable framebuffer; run 'mrca-ui info'"
+    return 2
+  fi
+  if [ -z "$(find_asset home "${W}x${H}" "$FMT")" ]; then
+    log "run: unsupported panel ${W}x${H} $FMT"
+    echo "no prebuilt profile for ${W}x${H} / $FMT"
+    echo "run 'mrca-ui info' for details, or build the native daemon"
+    return 3
+  fi
+  echo $$ > "$RUN/ui.pid"
+  set_screen home "${W}x${H}" "$FMT" "$STRIDE" "$H"
+  run_input "$W" "$H" "$STRIDE" "$H" "$FMT" "${W}x${H}"
+  rm -f "$RUN/ui.pid"
+  log "run: exit"
+}
+
+case "$1" in
+  info)  cmd_info ;;
+  show)  cmd_show "$2" ;;
+  run)   cmd_run ;;
+  *)
+    echo "usage: mrca-ui {info|show <home|apps|settings>|run}"
+    exit 2
+    ;;
+esac

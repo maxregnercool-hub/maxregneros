@@ -1,0 +1,82 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            api: 29
+          - abi: armeabi-v7a
+            api: 21
+          - abi: x86_64
+            api: 29
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+          unzip -q android-ndk-r26b-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26b" >> "$GITHUB_ENV"
+
+      - name: build
+        working-directory: payload/client/src
+        env:
+          ABI: ${{ matrix.abi }}
+          API: ${{ matrix.api }}
+        run: sh build.sh --ndk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mrca-${{ matrix.abi }}
+          path: payload/client/src/build/${{ matrix.abi }}/mrca-client
+
+  assemble:
+    name: assemble magisk module
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: _bins
+
+      - name: place binaries by ABI
+        run: |
+          mkdir -p bin/arm64-v8a bin/armeabi-v7a bin/x86_64
+          find _bins -name 'mrca-client' | while read -r f; do
+            case "$f" in
+              *arm64-v8a*)    cp "$f" bin/arm64-v8a/mrca-client ;;
+              *armeabi-v7a*)  cp "$f" bin/armeabi-v7a/mrca-client ;;
+              *x86_64*)       cp "$f" bin/x86_64/mrca-client ;;
+            esac
+          done
+          chmod 0755 bin/*/mrca-client
+          find bin -type f -exec file {} \;
+
+      - name: set version
+        id: v
+        run: echo "tag=${GITHUB_REF_NAME:-manual}" >> "$GITHUB_OUTPUT"
+
+      - name: assemble the flashable module
+        run: sh tools/assemble_module.sh "${{ steps.v.outputs.tag }}"
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MaxRegnerOS-*.zip
+          generate_release_notes: true
+          draft: false

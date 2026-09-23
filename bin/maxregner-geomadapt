@@ -1,0 +1,71 @@
+#!/system/bin/sh
+# MaxRegnerOS — adaptive geometry engine.
+#
+# Replaces the fixed 4-profile lookup in v1.5.  Every dimension is DERIVED from
+# the live panel size, so any resolution works with no pre-baked assets.
+#
+# Exposes: geom_derive W H     -> prints KEY=VALUE for the composer
+#          geom_snap16 N        -> round UP to a multiple of 16 (glyph scale unit)
+
+geom_snap16() {
+  local n="$1" r
+  r=$(( (n + 15) / 16 * 16 ))
+  [ "$r" -lt 16 ] && r=16
+  echo "$r"
+}
+
+# text scale: the rasteriser wants a size that is a multiple of 16
+# (scale = size/16, glyph cell = 8*scale x 16*scale)
+geom_txt_title() { local s="$1"; geom_snap16 $(( 24 * s )); }
+geom_txt_body()  { local s="$1"; geom_snap16 $(( 14 * s )); }
+geom_txt_small() { local s="$1"; geom_snap16 $(( 11 * s )); }
+
+geom_derive() {
+  local W="$1" H="$2"
+  # baseline design width of 360 "dp"; scale everything off it
+  local s=$(( W / 360 )); [ "$s" -lt 1 ] && s=1
+
+  local pad=$(( 14 * s ))
+  local gap=$(( 8 * s ))
+  local status_h=$(( 26 * s ))
+  local header_h=$(( 52 * s ))
+  local nav_h=$(( 54 * s ))
+  local radius=$(( 10 * s ))
+  local border=$(( 1 * s )); [ "$border" -lt 1 ] && border=1
+
+  # grid: 4 columns on phones, 5 on wide panels
+  local cols=4
+  [ "$W" -ge 900 ] && cols=5
+  [ "$W" -ge 1400 ] && cols=6
+
+  local avail=$(( W - 2 * pad - (cols - 1) * gap ))
+  local tile_w=$(( avail / cols ))
+  local tile_h=$(( tile_w + 26 * s ))     # square icon + label strip
+
+  local rows=$(( (H - status_h - header_h - nav_h - 2 * pad) / (tile_h + gap) ))
+  [ "$rows" -lt 1 ] && rows=1
+
+  local ts=$(geom_txt_title "$s")
+  local bs=$(geom_txt_body  "$s")
+  local ss=$(geom_txt_small "$s")
+
+  cat <<EOF
+GEOM_W=$W
+GEOM_H=$H
+GEOM_S=$s
+GEOM_PAD=$pad
+GEOM_GAP=$gap
+GEOM_STATUS_H=$status_h
+GEOM_HEADER_H=$header_h
+GEOM_NAV_H=$nav_h
+GEOM_RADIUS=$radius
+GEOM_BORDER=$border
+GEOM_COLS=$cols
+GEOM_ROWS=$rows
+GEOM_TILE_W=$tile_w
+GEOM_TILE_H=$tile_h
+GEOM_TITLE_SZ=$ts
+GEOM_BODY_SZ=$bs
+GEOM_SMALL_SZ=$ss
+EOF
+}

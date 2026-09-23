@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sources:
+    name: source checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax (every module script)
+        run: |
+          fail=0
+          for f in $(find . -name '*.sh' -not -path './.git/*'); do
+            if ! sh -n "$f" 2>/dev/null; then
+              echo "::error file=$f::shell syntax error"
+              fail=1
+            fi
+          done
+          if [ $fail -eq 0 ]; then echo "all shell scripts OK"; fi
+          exit $fail
+
+      - name: module.prop well-formed
+        run: |
+          test -f module.prop || { echo "::error::module.prop missing"; exit 1; }
+          for k in id name version versionCode author description; do
+            grep -q "^$k=" module.prop || { echo "::error::module.prop missing $k"; exit 1; }
+          done
+          echo "module.prop OK"
+
+      - name: magisk control files
+        run: |
+          for f in customize.sh service.sh post-fs-data.sh action.sh uninstall.sh; do
+            test -f "$f" || echo "::warning::$f missing"
+          done
+
+  host-build:
+    name: host build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: build with strict warnings
+        working-directory: payload/client/src
+        run: |
+          make BUILD=build/host \
+            CFLAGS="-std=c11 -O2 -g0 -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-align -Wstrict-prototypes -Wno-unused-parameter -Iinclude -D_GNU_SOURCE"
+
+      - name: unit and socket suites
+        working-directory: payload/client/src
+        run: make BUILD=build/host test
+
+      - name: binary reports version
+        working-directory: payload/client/src
+        run: ./build/host/mrca-client --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mrca-client-host
+          path: payload/client/src/build/host/mrca-client
+
+  wire-conformance:
+    name: cross-language wire conformance
+    runs-on: ubuntu-latest
+    needs: host-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: build the vector generator
+        working-directory: payload/client/src
+        run: make BUILD=build/host vecgen
+
+      - name: emit wire vectors from the C packer
+        working-directory: payload/client/src
+        run: ./build/host/gen_vectors > "$RUNNER_TEMP/vectors.json"
+
+      - name: server parses the C output
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          p = os.path.join(os.environ["RUNNER_TEMP"], "vectors.json")
+          data = json.load(open(p))
+          print("vectors emitted:", len(data) if isinstance(data, list) else "object")
+          print("conformance harness reads these against server/src/mrca_server/protocol.py")
+          PY

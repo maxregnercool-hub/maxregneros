@@ -1,0 +1,51 @@
+#!/system/bin/sh
+# MaxRegnerOS — paint the app drawer.
+#
+# Cost model: header 1 dd + list wipe 1 dd + one dd per visible row (each row
+# is a full-width strip, so no per-row compositing) + footer 1 dd.  A full
+# repaint of an 11-row drawer is ~14 dd calls.
+#
+# usage: maxregner-appdraw <geom> [scroll]
+
+. "$(dirname "$0")/mrca-applib.sh" 2>/dev/null || . /data/adb/maxregner/bin/mrca-applib.sh
+
+GID="$1"; SCROLL="${2:-0}"
+[ -z "$GID" ] && { echo "appdraw: geometry required"; exit 2; }
+geom_load "$GID" || { echo "appdraw: unknown geometry $GID"; exit 2; }
+
+FB=$(app_fbdev)
+[ -z "$FB" ] && { echo "appdraw: no framebuffer node found"; exit 2; }
+[ -w "$FB" ] || { echo "appdraw: $FB is not writable — run as root, or 'maxregner-ctl takeover'"; exit 2; }
+[ -s "$REGTSV" ] || { echo "appdraw: registry empty — run 'maxregner-apps sync'"; exit 4; }
+
+# header
+dd if="$MASSETS/ui/${GID}_header.raw" of="$FB" \
+   bs="$GSTRIDE" seek=0 count="$GHH" conv=notrunc 2>/dev/null
+# wipe the list area (zero == black in rgb565)
+dd if=/dev/zero of="$FB" \
+   bs="$GSTRIDE" seek="$GLISTY" count="$GLISTH" conv=notrunc 2>/dev/null
+
+# rows
+IDX=0
+Y=$GLISTY
+ENDBAND=$((GLISTY + GLISTH))
+SHOWN=0
+while IFS="	" read -r pkg lbl comp hue let is3; do
+  [ -z "$pkg" ] && continue
+  if [ "$IDX" -lt "$SCROLL" ]; then IDX=$((IDX + 1)); continue; fi
+  [ "$Y" -ge "$ENDBAND" ] && break
+  BP=$(band_path "$pkg")
+  if [ -s "$BP" ]; then
+    dd if="$BP" of="$FB" bs="$GSTRIDE" seek="$Y" count="$GBAND" conv=notrunc 2>/dev/null
+    SHOWN=$((SHOWN + 1))
+  fi
+  Y=$((Y + GBAND))
+  IDX=$((IDX + 1))
+done < "$REGTSV"
+
+# footer
+dd if="$MASSETS/ui/${GID}_footer.raw" of="$FB" \
+   bs="$GSTRIDE" seek=$((GH - GFH)) count="$GFH" conv=notrunc 2>/dev/null
+
+echo "drawn: $GID scroll=$SCROLL rows=$SHOWN visible=$GVIS"
+exit 0

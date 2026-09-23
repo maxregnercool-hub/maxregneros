@@ -1,0 +1,30 @@
+#!/system/bin/sh
+MODDIR=/data/adb/modules/maxregner
+MR=/data/adb/maxregner
+BIN="$MODDIR/bin"
+case "$1" in
+  takeover|start)  sh "$BIN/maxregner-takeover" arm ;;
+  restore|release) sh "$BIN/maxregner-takeover" restore ;;
+  status)
+    sh "$BIN/maxregner-takeover" status
+    echo "screen: $(cat "$MR/state/current_screen" 2>/dev/null || echo -)"
+    echo "geom:   $(cat "$MR/state/geom" 2>/dev/null || echo -)"
+    ;;
+  safemode)   touch "$MR/state/safemode"; echo "safe mode ON (takeover will not arm)" ;;
+  unsafemode) rm -f "$MR/state/safemode"; echo "safe mode OFF" ;;
+  screens)    ls "$MR/screens" 2>/dev/null ;;
+  show)       W=$(cut -d' ' -f1 "$MR/state/geom" 2>/dev/null)
+              H=$(cut -d' ' -f2 "$MR/state/geom" 2>/dev/null)
+              sh "$BIN/maxregner-screen" present "${2:-home}" "$W" "$H" ;;
+  doctor)
+    echo "== MaxRegnerOS doctor =="
+    for d in /dev/graphics/fb0 /dev/dri/card0; do
+      [ -e "$d" ] && echo "display: $d" || echo "display: $d MISSING"
+    done
+    echo "touch: $(for e in /dev/input/event*; do getevent -pl "$e" 2>/dev/null | grep -q ABS_MT_POSITION_X && echo $e; done | head -1)"
+    echo "root: $(id -u)"
+    echo "geom: $(cat "$MR/state/geom" 2>/dev/null || echo 'not detected')"
+    sh "$BIN/maxregner-takeover" status
+    ;;
+  *) echo "maxregner-ctl {takeover|restore|status|safemode|unsafemode|screens|show <name>|doctor}" ;;
+esac
